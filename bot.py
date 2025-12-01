@@ -269,7 +269,7 @@ def sum_for_date_range(chat_id: int, start_date: date, end_date: date) -> float:
     return sum_distance_for_period(chat_id, int(start_dt.timestamp()), int(end_dt.timestamp()))
 
 
-# === COMMANDS: /week, /period, /setbase, /report, /help ===
+# === COMMANDS: /week, /thisweek, /period, /setbase, /report, /help ===
 
 @bot.message_handler(commands=["week"])
 def handle_week(message: telebot.types.Message):
@@ -282,6 +282,23 @@ def handle_week(message: telebot.types.Message):
 
     reply = (
         f"📆 Отчёт за прошлую неделю "
+        f"({start_date.strftime('%d.%m.%Y')}–{end_date.strftime('%d.%m.%Y')}):\n"
+        f"🚗 Общий пробег: {round(total_km, 1)} км"
+    )
+    bot.reply_to(message, reply)
+
+
+@bot.message_handler(commands=["thisweek"])
+def handle_this_week(message: telebot.types.Message):
+    """
+    /thisweek — отчёт за текущую неделю (с понедельника по сегодня).
+    """
+    chat_id = message.chat.id
+    start_date, end_date = get_this_week_range()
+    total_km = sum_for_date_range(chat_id, start_date, end_date)
+
+    reply = (
+        f"📆 Отчёт за текущую неделю "
         f"({start_date.strftime('%d.%m.%Y')}–{end_date.strftime('%d.%m.%Y')}):\n"
         f"🚗 Общий пробег: {round(total_km, 1)} км"
     )
@@ -386,6 +403,7 @@ def handle_help(message: telebot.types.Message):
     text = (
         "📘 Команды бота:\n\n"
         "/week – отчёт за прошлую неделю\n"
+        "/thisweek – отчёт за текущую неделю\n"
         "/period YYYY-MM-DD YYYY-MM-DD – отчёт за указанный период\n"
         "/report – меню выбора периода (кнопки)\n"
         "/setbase АДРЕС – изменить точку старта/финиша\n"
