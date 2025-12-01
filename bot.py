@@ -24,6 +24,7 @@ if not TELEGRAM_TOKEN:
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 app = Flask(__name__)
 
+# Подсказки городов/локаций для поиска адресных строк
 CITY_HINTS = [
     "Київ", "Киев",
     "Ірпінь", "Ирпень",
@@ -65,7 +66,7 @@ def init_db():
 
 
 def log_route(chat_id: int, msg_timestamp: int, distance_km: float, raw_text: str):
-    """Сохраняем маршрут в базу."""
+    """Сохраняем один маршрут в базу."""
     if distance_km <= 0:
         return
     with sqlite3.connect(DB_PATH) as conn:
@@ -230,7 +231,7 @@ def get_distance_km(base: str, waypoints: list[str]) -> float:
 # === HELPERS ДЛЯ ПЕРИОДОВ ===
 
 def get_last_week_range():
-    """Возвращает (start_date, end_date) для прошлой календарной недели (Пн–Вс)."""
+    """Прошлая календарная неделя (Пн–Вс)."""
     today = datetime.now(timezone.utc).date()
     this_monday = today - timedelta(days=today.weekday())
     prev_monday = this_monday - timedelta(days=7)
@@ -262,27 +263,27 @@ def get_this_month_range():
 
 
 def sum_for_date_range(chat_id: int, start_date: date, end_date: date) -> float:
-    """Обёртка: считает километраж за диапазон дат (по датам, не по timestamp)."""
+    """Считает километраж за диапазон дат (по датам)."""
     start_dt = datetime(start_date.year, start_date.month, start_date.day, 0, 0, 0, tzinfo=timezone.utc)
     end_dt = datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59, tzinfo=timezone.utc)
     return sum_distance_for_period(chat_id, int(start_dt.timestamp()), int(end_dt.timestamp()))
 
 
-# === COMMANDS: /week, /period, /setbase, /report ===
+# === COMMANDS: /week, /period, /setbase, /report, /help ===
 
 @bot.message_handler(commands=["week"])
 def handle_week(message: telebot.types.Message):
     """
-    /week — сумма км за прошлую календарную неделю (Пн–Вс) для этого чата.
+    /week — отчёт за прошлую календарную неделю (Пн–Вс) для этого чата.
     """
     chat_id = message.chat.id
     start_date, end_date = get_last_week_range()
     total_km = sum_for_date_range(chat_id, start_date, end_date)
 
     reply = (
-        f"📆 Звіт за минулий тиждень "
+        f"📆 Отчёт за прошлую неделю "
         f"({start_date.strftime('%d.%m.%Y')}–{end_date.strftime('%d.%m.%Y')}):\n"
-        f"🚗 Загальний пробіг: {round(total_km, 1)} км"
+        f"🚗 Общий пробег: {round(total_km, 1)} км"
     )
     bot.reply_to(message, reply)
 
@@ -291,7 +292,7 @@ def handle_week(message: telebot.types.Message):
 def handle_period(message: telebot.types.Message):
     """
     /period YYYY-MM-DD YYYY-MM-DD
-    Наприклад:
+    Например:
     /period 2025-11-01 2025-11-30
     """
     chat_id = message.chat.id
@@ -300,7 +301,7 @@ def handle_period(message: telebot.types.Message):
         bot.reply_to(
             message,
             "Формат: /period YYYY-MM-DD YYYY-MM-DD\n"
-            "Наприклад: /period 2025-11-01 2025-11-30",
+            "Например: /period 2025-11-01 2025-11-30",
         )
         return
 
@@ -308,18 +309,18 @@ def handle_period(message: telebot.types.Message):
         start_date = datetime.strptime(parts[1], "%Y-%m-%d").date()
         end_date = datetime.strptime(parts[2], "%Y-%m-%d").date()
     except ValueError:
-        bot.reply_to(message, "Невірний формат дати. Використовуй YYYY-MM-DD.")
+        bot.reply_to(message, "Неверный формат даты. Используй YYYY-MM-DD.")
         return
 
     if end_date < start_date:
-        bot.reply_to(message, "Кінцева дата раніше за початкову 🤔")
+        bot.reply_to(message, "Конечная дата раньше начальной 🤔")
         return
 
     total_km = sum_for_date_range(chat_id, start_date, end_date)
 
     reply = (
-        f"📆 Звіт за період {start_date.strftime('%d.%m.%Y')}–{end_date.strftime('%d.%m.%Y')}:\n"
-        f"🚗 Загальний пробіг: {round(total_km, 1)} км"
+        f"📆 Отчёт за период {start_date.strftime('%d.%m.%Y')}–{end_date.strftime('%d.%m.%Y')}:\n"
+        f"🚗 Общий пробег: {round(total_km, 1)} км"
     )
     bot.reply_to(message, reply)
 
@@ -329,7 +330,7 @@ def handle_set_base(message: telebot.types.Message):
     """
     /setbase НОВЫЙ АДРЕС
     Пример:
-    /setbase Art Mall, вул. Заболотного 37, Київ
+    /setbase Art Mall, ул. Заболотного 37, Киев
     """
     chat_id = message.chat.id
     parts = message.text.split(" ", 1)
@@ -337,9 +338,9 @@ def handle_set_base(message: telebot.types.Message):
     if len(parts) < 2 or not parts[1].strip():
         bot.reply_to(
             message,
-            "Використання:\n\n"
+            "Использование:\n\n"
             "/setbase Харківське шосе 19А, Київ\n"
-            "/setbase Art Mall, вул. Заболотного 37, Київ",
+            "/setbase Art Mall, ул. Заболотного 37, Киев",
         )
         return
 
@@ -348,36 +349,51 @@ def handle_set_base(message: telebot.types.Message):
 
     bot.reply_to(
         message,
-        f"✅ Нову старт/фініш точку встановлено:\n{new_base}",
+        f"✅ Новая точка старта/финиша установлена:\n{new_base}",
     )
 
 
 @bot.message_handler(commands=["report"])
 def handle_report(message: telebot.types.Message):
     """
-    /report — показать кнопки для выбора типового периода:
-      - прошлый / этот тиждень
-      - прошлый / этот місяць
+    /report — показать кнопки выбора типового периода:
+      - прошлая / текущая неделя
+      - прошлый / текущий месяц
       - ручной ввод (/period)
     """
     markup = InlineKeyboardMarkup()
     markup.row(
-        InlineKeyboardButton("Минулый тиждень", callback_data="report:last_week"),
-        InlineKeyboardButton("Цей тиждень", callback_data="report:this_week"),
+        InlineKeyboardButton("Прошлая неделя", callback_data="report:last_week"),
+        InlineKeyboardButton("Текущая неделя", callback_data="report:this_week"),
     )
     markup.row(
-        InlineKeyboardButton("Минулый місяць", callback_data="report:last_month"),
-        InlineKeyboardButton("Цей місяць", callback_data="report:this_month"),
+        InlineKeyboardButton("Прошлый месяц", callback_data="report:last_month"),
+        InlineKeyboardButton("Текущий месяц", callback_data="report:this_month"),
     )
     markup.row(
-        InlineKeyboardButton("Ввести дати вручну", callback_data="report:manual"),
+        InlineKeyboardButton("Ввести даты вручную", callback_data="report:manual"),
     )
 
     bot.reply_to(
         message,
-        "Оберіть період для звіту:",
+        "Выбери период для отчёта:",
         reply_markup=markup,
     )
+
+
+@bot.message_handler(commands=["help", "start"])
+def handle_help(message: telebot.types.Message):
+    text = (
+        "📘 Команды бота:\n\n"
+        "/week – отчёт за прошлую неделю\n"
+        "/period YYYY-MM-DD YYYY-MM-DD – отчёт за указанный период\n"
+        "/report – меню выбора периода (кнопки)\n"
+        "/setbase АДРЕС – изменить точку старта/финиша\n"
+        "/help – показать это меню\n\n"
+        "Чтобы посчитать маршрут: просто пришли сообщение с адресами, "
+        "бот построит маршрут, посчитает километраж и сохранит в статистику 🚗"
+    )
+    bot.reply_to(message, text)
 
 
 @bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("report:"))
@@ -389,9 +405,9 @@ def handle_report_callback(call):
         start_date, end_date = get_last_week_range()
         total_km = sum_for_date_range(chat_id, start_date, end_date)
         text = (
-            f"📆 Звіт за минулий тиждень "
+            f"📆 Отчёт за прошлую неделю "
             f"({start_date.strftime('%d.%m.%Y')}–{end_date.strftime('%d.%m.%Y')}):\n"
-            f"🚗 Загальний пробіг: {round(total_km, 1)} км"
+            f"🚗 Общий пробег: {round(total_km, 1)} км"
         )
         bot.answer_callback_query(call.id, "Готово ✅")
         bot.send_message(chat_id, text)
@@ -400,9 +416,9 @@ def handle_report_callback(call):
         start_date, end_date = get_this_week_range()
         total_km = sum_for_date_range(chat_id, start_date, end_date)
         text = (
-            f"📆 Звіт за цей тиждень "
+            f"📆 Отчёт за текущую неделю "
             f"({start_date.strftime('%d.%m.%Y')}–{end_date.strftime('%d.%m.%Y')}):\n"
-            f"🚗 Загальний пробіг: {round(total_km, 1)} км"
+            f"🚗 Общий пробег: {round(total_km, 1)} км"
         )
         bot.answer_callback_query(call.id, "Готово ✅")
         bot.send_message(chat_id, text)
@@ -411,9 +427,9 @@ def handle_report_callback(call):
         start_date, end_date = get_last_month_range()
         total_km = sum_for_date_range(chat_id, start_date, end_date)
         text = (
-            f"📆 Звіт за минулий місяць "
+            f"📆 Отчёт за прошлый месяц "
             f"({start_date.strftime('%d.%m.%Y')}–{end_date.strftime('%d.%m.%Y')}):\n"
-            f"🚗 Загальний пробіг: {round(total_km, 1)} км"
+            f"🚗 Общий пробег: {round(total_km, 1)} км"
         )
         bot.answer_callback_query(call.id, "Готово ✅")
         bot.send_message(chat_id, text)
@@ -422,9 +438,9 @@ def handle_report_callback(call):
         start_date, end_date = get_this_month_range()
         total_km = sum_for_date_range(chat_id, start_date, end_date)
         text = (
-            f"📆 Звіт за цей місяць "
+            f"📆 Отчёт за текущий месяц "
             f"({start_date.strftime('%d.%m.%Y')}–{end_date.strftime('%d.%m.%Y')}):\n"
-            f"🚗 Загальний пробіг: {round(total_km, 1)} км"
+            f"🚗 Общий пробег: {round(total_km, 1)} км"
         )
         bot.answer_callback_query(call.id, "Готово ✅")
         bot.send_message(chat_id, text)
@@ -433,9 +449,9 @@ def handle_report_callback(call):
         bot.answer_callback_query(call.id)
         bot.send_message(
             chat_id,
-            "Надішли команду у форматі:\n"
+            "Пришли команду в формате:\n"
             "/period YYYY-MM-DD YYYY-MM-DD\n"
-            "Наприклад: /period 2025-11-01 2025-11-30",
+            "Например: /period 2025-11-01 2025-11-30",
         )
 
 
@@ -466,7 +482,7 @@ def handle_message(message: telebot.types.Message):
         raw_text=message.text,
     )
 
-    reply_lines = [f"🚗 Маршрут на день (старт/фініш: {base}):", ""]
+    reply_lines = [f"🚗 Маршрут на день (старт/финиш: {base}):", ""]
 
     for i, a in enumerate(addresses, start=1):
         reply_lines.append(f"{i}) {a}")
@@ -475,9 +491,9 @@ def handle_message(message: telebot.types.Message):
     reply_lines.append(f"🔗 Маршрут: {maps_url}")
 
     if distance > 0:
-        reply_lines.append(f"📏 Дистанція: {distance} км")
+        reply_lines.append(f"📏 Дистанция: {distance} км")
     else:
-        reply_lines.append("📏 Не вдалося порахувати дистанцію.")
+        reply_lines.append("📏 Не удалось посчитать дистанцию.")
 
     text = "\n".join(reply_lines)
     bot.reply_to(message, text)
