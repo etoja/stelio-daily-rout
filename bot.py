@@ -10,7 +10,7 @@ import urllib.parse
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GOOGLE_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 
-BASE_POINT = "Метро Харківська, Київ"
+BASE_POINT = "Харківське шосе 19А, Київ"
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN не задан!")
