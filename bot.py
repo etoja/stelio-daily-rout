@@ -56,22 +56,17 @@ def extract_addresses(text: str):
     return result
 
 
-# === URL BUILDER (НОРМАЛЬНЫЙ, БЕЗ КОДИРОВАНИЯ!) ===
+# === URL BUILDER (КРАСИВАЯ ССЫЛКА) ===
 
 def build_maps_url(base: str, waypoints: list[str]) -> str:
     """
-    Строим URL без ручного кодирования.
-    Адреса передаются живым текстом.
-    Телеграм сам корректно кодирует ссылку при отправке.
+    Красивый формат:
+    https://www.google.com/maps/dir/Точка1/Точка2/…/ТочкаN
+    Без ручного кодирования — Google сам разберётся.
     """
-    url = "https://www.google.com/maps/dir/?api=1&travelmode=driving"
-    url += f"&origin={base}"
-    url += f"&destination={base}"
-
-    if waypoints:
-        url += "&waypoints=" + "|".join(waypoints)
-
-    return url
+    points = [base] + waypoints + [base]  # старт → точки → финиш
+    path = "/".join(points)
+    return "https://www.google.com/maps/dir/" + path
 
 
 # === DISTANCE COUNTING ===
@@ -120,7 +115,7 @@ def handle_message(message):
     addresses = extract_addresses(message.text)
 
     if not addresses:
-        return  # Молчим, если нет адресов
+        return  # если нет адресов — молчим
 
     maps_url = build_maps_url(BASE_POINT, addresses)
     distance = get_distance_km(BASE_POINT, addresses)
@@ -165,6 +160,6 @@ if __name__ == "__main__":
         bot.set_webhook(url=webhook_url)
         print("Webhook set to:", webhook_url)
     else:
-        print("WARNING: RENDER_EXTERNAL_URL не задан. Поставь вебхук вручную.")
+        print("WARNING: RENDER_EXTERNAL_URL не задан. Надо поставить вебхук вручную.")
 
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
