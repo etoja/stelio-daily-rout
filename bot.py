@@ -4,14 +4,19 @@ import requests
 import telebot
 from flask import Flask, request
 import urllib.parse
+import sqlite3
+from datetime import datetime, timedelta, timezone, date
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # === CONFIG ===
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GOOGLE_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 
-# Точка старт/финиш
-BASE_POINT = "Харківське шосе 19А, Київ"
+# Базовая точка по умолчанию (если не переопределена командой /setbase для чата)
+DEFAULT_BASE_POINT = "Харківське шосе 19А, Київ"
+
+DB_PATH = "routes.db"
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN не задан!")
@@ -19,7 +24,6 @@ if not TELEGRAM_TOKEN:
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 app = Flask(__name__)
 
-# Города / посёлки
 CITY_HINTS = [
     "Київ", "Киев",
     "Ірпінь", "Ирпень",
@@ -28,6 +32,95 @@ CITY_HINTS = [
     "Білогородка", "Гнідин", "Святопетрівське",
     "Вишневе", "Солом‘янка", "Соломянка",
 ]
+
+
+# === DB HELPERS ===
+
+def init_db():
+    """Создаем таблицы, если их ещё нет."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        # Логи маршрутов
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS routes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                msg_timestamp INTEGER NOT NULL,
+                distance_km REAL NOT NULL,
+                raw_text TEXT
+            )
+            """
+        )
+        # Настройки чата (старт/финиш)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                chat_id INTEGER PRIMARY KEY,
+                base_point TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def log_route(chat_id: int, msg_timestamp: int, distance_km: float, raw_text: str):
+    """Сохраняем маршрут в базу."""
+    if distance_km <= 0:
+        return
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO routes (chat_id, msg_timestamp, distance_km, raw_text) VALUES (?, ?, ?, ?)",
+            (chat_id, msg_timestamp, distance_km, raw_text),
+        )
+        conn.commit()
+
+
+def sum_distance_for_period(chat_id: int, start_ts: int, end_ts: int) -> float:
+    """Сумма километров по чату за период [start_ts, end_ts]."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT COALESCE(SUM(distance_km), 0)
+            FROM routes
+            WHERE chat_id = ?
+              AND msg_timestamp BETWEEN ? AND ?
+            """,
+            (chat_id, start_ts, end_ts),
+        )
+        row = cur.fetchone()
+        return float(row[0] or 0.0)
+
+
+def set_base_point(chat_id: int, base_point: str):
+    """Сохраняем старт/финиш точку для конкретного чата."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO settings (chat_id, base_point)
+            VALUES (?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET base_point = excluded.base_point
+            """,
+            (chat_id, base_point),
+        )
+        conn.commit()
+
+
+def get_base_point(chat_id: int) -> str:
+    """Получаем старт/финиш точку для чата, если нет — возвращаем дефолтную."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT base_point FROM settings WHERE chat_id = ?",
+            (chat_id,),
+        )
+        row = cur.fetchone()
+        if row:
+            return row[0]
+    return DEFAULT_BASE_POINT
 
 
 # === ADDRESS EXTRACTION ===
@@ -44,7 +137,7 @@ def extract_addresses(text: str):
 
     street_re = re.compile(
         r"(вул\.|вулиця|улица|ул\.|просп\.|пр-т|проспект|шосе|ш\.)",
-        re.IGNORECASE
+        re.IGNORECASE,
     )
 
     for line in lines:
@@ -75,7 +168,7 @@ def extract_addresses(text: str):
     return result
 
 
-# === URL BUILDER (кодируем, чтобы не было пробелов) ===
+# === URL BUILDER (кодируем для безопасной ссылки) ===
 
 def encode_point(point: str) -> str:
     """
@@ -83,14 +176,14 @@ def encode_point(point: str) -> str:
     пробелы и кириллица → %D0..., %20 и т.д.,
     чтобы Telegram видел ссылку как одно целое.
     """
-    return urllib.parse.quote(point, safe="")  # ничего не оставляем сырым
+    return urllib.parse.quote(point, safe="")
 
 
 def build_maps_url(base: str, waypoints: list[str]) -> str:
     """
     Формат:
     https://www.google.com/maps/dir/POINT1/POINT2/.../POINTN
-    где POINT* уже закодированы.
+    где POINT* уже кодированы.
     """
     points = [base] + waypoints + [base]
     encoded_points = [encode_point(p) for p in points]
@@ -121,7 +214,7 @@ def get_distance_km(base: str, waypoints: list[str]) -> float:
     resp = requests.get(
         "https://maps.googleapis.com/maps/api/directions/json",
         params=params,
-        timeout=10
+        timeout=10,
     )
 
     data = resp.json()
@@ -134,11 +227,226 @@ def get_distance_km(base: str, waypoints: list[str]) -> float:
     return round(meters / 1000.0, 1)
 
 
-# === BOT HANDLER ===
+# === HELPERS ДЛЯ ПЕРИОДОВ ===
+
+def get_last_week_range():
+    """Возвращает (start_date, end_date) для прошлой календарной недели (Пн–Вс)."""
+    today = datetime.now(timezone.utc).date()
+    this_monday = today - timedelta(days=today.weekday())
+    prev_monday = this_monday - timedelta(days=7)
+    prev_sunday = prev_monday + timedelta(days=6)
+    return prev_monday, prev_sunday
+
+
+def get_this_week_range():
+    """Текущая неделя: с понедельника по сегодня."""
+    today = datetime.now(timezone.utc).date()
+    this_monday = today - timedelta(days=today.weekday())
+    return this_monday, today
+
+
+def get_last_month_range():
+    """Прошлый месяц: с 1-го по последний день предыдущего месяца."""
+    today = datetime.now(timezone.utc).date()
+    first_this_month = date(today.year, today.month, 1)
+    last_prev_month = first_this_month - timedelta(days=1)
+    first_prev_month = date(last_prev_month.year, last_prev_month.month, 1)
+    return first_prev_month, last_prev_month
+
+
+def get_this_month_range():
+    """Текущий месяц: с 1-го по сегодня."""
+    today = datetime.now(timezone.utc).date()
+    first_this_month = date(today.year, today.month, 1)
+    return first_this_month, today
+
+
+def sum_for_date_range(chat_id: int, start_date: date, end_date: date) -> float:
+    """Обёртка: считает километраж за диапазон дат (по датам, не по timestamp)."""
+    start_dt = datetime(start_date.year, start_date.month, start_date.day, 0, 0, 0, tzinfo=timezone.utc)
+    end_dt = datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59, tzinfo=timezone.utc)
+    return sum_distance_for_period(chat_id, int(start_dt.timestamp()), int(end_dt.timestamp()))
+
+
+# === COMMANDS: /week, /period, /setbase, /report ===
+
+@bot.message_handler(commands=["week"])
+def handle_week(message: telebot.types.Message):
+    """
+    /week — сумма км за прошлую календарную неделю (Пн–Вс) для этого чата.
+    """
+    chat_id = message.chat.id
+    start_date, end_date = get_last_week_range()
+    total_km = sum_for_date_range(chat_id, start_date, end_date)
+
+    reply = (
+        f"📆 Звіт за минулий тиждень "
+        f"({start_date.strftime('%d.%m.%Y')}–{end_date.strftime('%d.%m.%Y')}):\n"
+        f"🚗 Загальний пробіг: {round(total_km, 1)} км"
+    )
+    bot.reply_to(message, reply)
+
+
+@bot.message_handler(commands=["period"])
+def handle_period(message: telebot.types.Message):
+    """
+    /period YYYY-MM-DD YYYY-MM-DD
+    Наприклад:
+    /period 2025-11-01 2025-11-30
+    """
+    chat_id = message.chat.id
+    parts = message.text.strip().split()
+    if len(parts) != 3:
+        bot.reply_to(
+            message,
+            "Формат: /period YYYY-MM-DD YYYY-MM-DD\n"
+            "Наприклад: /period 2025-11-01 2025-11-30",
+        )
+        return
+
+    try:
+        start_date = datetime.strptime(parts[1], "%Y-%m-%d").date()
+        end_date = datetime.strptime(parts[2], "%Y-%m-%d").date()
+    except ValueError:
+        bot.reply_to(message, "Невірний формат дати. Використовуй YYYY-MM-DD.")
+        return
+
+    if end_date < start_date:
+        bot.reply_to(message, "Кінцева дата раніше за початкову 🤔")
+        return
+
+    total_km = sum_for_date_range(chat_id, start_date, end_date)
+
+    reply = (
+        f"📆 Звіт за період {start_date.strftime('%d.%m.%Y')}–{end_date.strftime('%d.%m.%Y')}:\n"
+        f"🚗 Загальний пробіг: {round(total_km, 1)} км"
+    )
+    bot.reply_to(message, reply)
+
+
+@bot.message_handler(commands=["setbase"])
+def handle_set_base(message: telebot.types.Message):
+    """
+    /setbase НОВЫЙ АДРЕС
+    Пример:
+    /setbase Art Mall, вул. Заболотного 37, Київ
+    """
+    chat_id = message.chat.id
+    parts = message.text.split(" ", 1)
+
+    if len(parts) < 2 or not parts[1].strip():
+        bot.reply_to(
+            message,
+            "Використання:\n\n"
+            "/setbase Харківське шосе 19А, Київ\n"
+            "/setbase Art Mall, вул. Заболотного 37, Київ",
+        )
+        return
+
+    new_base = parts[1].strip()
+    set_base_point(chat_id, new_base)
+
+    bot.reply_to(
+        message,
+        f"✅ Нову старт/фініш точку встановлено:\n{new_base}",
+    )
+
+
+@bot.message_handler(commands=["report"])
+def handle_report(message: telebot.types.Message):
+    """
+    /report — показать кнопки для выбора типового периода:
+      - прошлый / этот тиждень
+      - прошлый / этот місяць
+      - ручной ввод (/period)
+    """
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("Минулый тиждень", callback_data="report:last_week"),
+        InlineKeyboardButton("Цей тиждень", callback_data="report:this_week"),
+    )
+    markup.row(
+        InlineKeyboardButton("Минулый місяць", callback_data="report:last_month"),
+        InlineKeyboardButton("Цей місяць", callback_data="report:this_month"),
+    )
+    markup.row(
+        InlineKeyboardButton("Ввести дати вручну", callback_data="report:manual"),
+    )
+
+    bot.reply_to(
+        message,
+        "Оберіть період для звіту:",
+        reply_markup=markup,
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("report:"))
+def handle_report_callback(call):
+    chat_id = call.message.chat.id
+    data = call.data.split(":", 1)[1]
+
+    if data == "last_week":
+        start_date, end_date = get_last_week_range()
+        total_km = sum_for_date_range(chat_id, start_date, end_date)
+        text = (
+            f"📆 Звіт за минулий тиждень "
+            f"({start_date.strftime('%d.%m.%Y')}–{end_date.strftime('%d.%m.%Y')}):\n"
+            f"🚗 Загальний пробіг: {round(total_km, 1)} км"
+        )
+        bot.answer_callback_query(call.id, "Готово ✅")
+        bot.send_message(chat_id, text)
+
+    elif data == "this_week":
+        start_date, end_date = get_this_week_range()
+        total_km = sum_for_date_range(chat_id, start_date, end_date)
+        text = (
+            f"📆 Звіт за цей тиждень "
+            f"({start_date.strftime('%d.%m.%Y')}–{end_date.strftime('%d.%m.%Y')}):\n"
+            f"🚗 Загальний пробіг: {round(total_km, 1)} км"
+        )
+        bot.answer_callback_query(call.id, "Готово ✅")
+        bot.send_message(chat_id, text)
+
+    elif data == "last_month":
+        start_date, end_date = get_last_month_range()
+        total_km = sum_for_date_range(chat_id, start_date, end_date)
+        text = (
+            f"📆 Звіт за минулий місяць "
+            f"({start_date.strftime('%d.%m.%Y')}–{end_date.strftime('%d.%m.%Y')}):\n"
+            f"🚗 Загальний пробіг: {round(total_km, 1)} км"
+        )
+        bot.answer_callback_query(call.id, "Готово ✅")
+        bot.send_message(chat_id, text)
+
+    elif data == "this_month":
+        start_date, end_date = get_this_month_range()
+        total_km = sum_for_date_range(chat_id, start_date, end_date)
+        text = (
+            f"📆 Звіт за цей місяць "
+            f"({start_date.strftime('%d.%m.%Y')}–{end_date.strftime('%d.%m.%Y')}):\n"
+            f"🚗 Загальний пробіг: {round(total_km, 1)} км"
+        )
+        bot.answer_callback_query(call.id, "Готово ✅")
+        bot.send_message(chat_id, text)
+
+    elif data == "manual":
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            chat_id,
+            "Надішли команду у форматі:\n"
+            "/period YYYY-MM-DD YYYY-MM-DD\n"
+            "Наприклад: /period 2025-11-01 2025-11-30",
+        )
+
+
+# === MAIN HANDLER ДЛЯ МАРШРУТОВ ===
 
 @bot.message_handler(func=lambda m: True)
-def handle_message(message):
-    if not message.text:
+def handle_message(message: telebot.types.Message):
+    # команды выше уже обработаны
+    if message.text is None:
+        return
+    if message.text.startswith("/"):
         return
 
     addresses = extract_addresses(message.text)
@@ -146,10 +454,19 @@ def handle_message(message):
     if not addresses:
         return  # если нет адресов — молчим
 
-    maps_url = build_maps_url(BASE_POINT, addresses)
-    distance = get_distance_km(BASE_POINT, addresses)
+    base = get_base_point(message.chat.id)
+    maps_url = build_maps_url(base, addresses)
+    distance = get_distance_km(base, addresses)
 
-    reply_lines = ["🚗 Маршрут на день (старт/фініш: Харківське шосе 19А, Київ):", ""]
+    # логируем в базу
+    log_route(
+        chat_id=message.chat.id,
+        msg_timestamp=message.date,  # unix timestamp от Telegram
+        distance_km=distance,
+        raw_text=message.text,
+    )
+
+    reply_lines = [f"🚗 Маршрут на день (старт/фініш: {base}):", ""]
 
     for i, a in enumerate(addresses, start=1):
         reply_lines.append(f"{i}) {a}")
@@ -182,6 +499,8 @@ def index():
 
 
 if __name__ == "__main__":
+    init_db()
+
     base_url = os.getenv("RENDER_EXTERNAL_URL")
 
     if base_url:
