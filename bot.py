@@ -3,6 +3,7 @@ import re
 import requests
 import telebot
 from flask import Flask, request
+import urllib.parse
 
 # === CONFIG ===
 
@@ -56,23 +57,33 @@ def extract_addresses(text: str):
     return result
 
 
-# === URL BUILDER (КРАСИВАЯ ССЫЛКА) ===
+# === URL BUILDER (кодируем, чтобы НЕ было пробелов) ===
+
+def encode_point(point: str) -> str:
+    """
+    Кодируем адрес для URL.
+    Все пробелы и кириллица превращаются в %D0... и %20,
+    чтобы Telegram видел ссылку как одно целое и не рвал её.
+    """
+    return urllib.parse.quote(point, safe="")  # ничего не оставляем «сырым»
+
 
 def build_maps_url(base: str, waypoints: list[str]) -> str:
     """
-    Красивый формат:
-    https://www.google.com/maps/dir/Точка1/Точка2/…/ТочкаN
-    Без ручного кодирования — Google сам разберётся.
+    Формат:
+    https://www.google.com/maps/dir/Точка1/Точка2/.../ТочкаN
+    (но все точки уже процодированы encode_point)
     """
-    points = [base] + waypoints + [base]  # старт → точки → финиш
-    path = "/".join(points)
+    points = [base] + waypoints + [base]
+    encoded_points = [encode_point(p) for p in points]
+    path = "/".join(encoded_points)
     return "https://www.google.com/maps/dir/" + path
 
 
 # === DISTANCE COUNTING ===
 
 def get_distance_km(base: str, waypoints: list[str]) -> float:
-    """Считаем дистанцию через Google Directions API."""
+    """Считаем дистанцию через Google Directions API (НЕ кодированные строки!)."""
     if not GOOGLE_API_KEY:
         print("Нет GOOGLE_MAPS_API_KEY!")
         return -1
@@ -126,8 +137,8 @@ def handle_message(message):
         reply_lines.append(f"{i}) {a}")
 
     reply_lines.append("")
-    # ВАЖНО: оборачиваем ссылку в < >, чтобы Telegram не ломал её по пробелам
-    reply_lines.append(f"🔗 Маршрут: <{maps_url}>")
+    # ТУТ уже закодированная строка без пробелов — Telegram не порвёт ссылку
+    reply_lines.append(f"🔗 Маршрут: {maps_url}")
 
     if distance > 0:
         reply_lines.append(f"📏 Дистанція: {distance} км")
@@ -135,7 +146,7 @@ def handle_message(message):
         reply_lines.append("📏 Не вдалося порахувати дистанцію.")
 
     text = "\n".join(reply_lines)
-    bot.reply_to(message, text, parse_mode="HTML")
+    bot.reply_to(message, text)  # БЕЗ parse_mode, обычный текст
 
 
 # === FLASK / WEBHOOK ===
