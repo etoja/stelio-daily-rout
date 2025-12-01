@@ -120,20 +120,22 @@ def handle_message(message):
     maps_url = build_maps_url(BASE_POINT, addresses)
     distance = get_distance_km(BASE_POINT, addresses)
 
-    reply = ["🚗 Маршрут на день (старт/фініш: м. Харківська):", ""]
+    reply_lines = ["🚗 Маршрут на день (старт/фініш: м. Харківська):", ""]
 
     for i, a in enumerate(addresses, start=1):
-        reply.append(f"{i}) {a}")
+        reply_lines.append(f"{i}) {a}")
 
-    reply.append("")
-    reply.append(f"🔗 Маршрут: {maps_url}")
+    reply_lines.append("")
+    # ВАЖНО: оборачиваем ссылку в < >, чтобы Telegram не ломал её по пробелам
+    reply_lines.append(f"🔗 Маршрут: <{maps_url}>")
 
     if distance > 0:
-        reply.append(f"📏 Дистанція: {distance} км")
+        reply_lines.append(f"📏 Дистанція: {distance} км")
     else:
-        reply.append("📏 Не вдалося порахувати дистанцію.")
+        reply_lines.append("📏 Не вдалося порахувати дистанцію.")
 
-    bot.reply_to(message, "\n".join(reply))
+    text = "\n".join(reply_lines)
+    bot.reply_to(message, text, parse_mode="HTML")
 
 
 # === FLASK / WEBHOOK ===
