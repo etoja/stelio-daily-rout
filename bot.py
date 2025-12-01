@@ -10,6 +10,7 @@ import urllib.parse
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GOOGLE_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 
+# Точка старт/финиш
 BASE_POINT = "Харківське шосе 19А, Київ"
 
 if not TELEGRAM_TOKEN:
@@ -18,32 +19,49 @@ if not TELEGRAM_TOKEN:
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 app = Flask(__name__)
 
+# Города / посёлки
 CITY_HINTS = [
     "Київ", "Киев",
     "Ірпінь", "Ирпень",
     "Гостомель", "Буча",
     "Чабани", "Крюківщина", "Крюковщина",
     "Білогородка", "Гнідин", "Святопетрівське",
-    "Вишневе", "Солом‘янка"
+    "Вишневе", "Солом‘янка", "Соломянка",
 ]
 
 
 # === ADDRESS EXTRACTION ===
 
 def extract_addresses(text: str):
-    """Извлекаем адреса из сообщения."""
+    """
+    Извлекаем адресные строки:
+    - либо содержат город из CITY_HINTS
+    - либо содержат "вул./вулиця/ул./просп./шосе" + цифру (улица + дом)
+    Если в строке нет города, подставляем ", Київ" по умолчанию.
+    """
     addresses = []
     lines = [l.strip() for l in text.split("\n") if l.strip()]
 
-    pattern = re.compile(r"(" + "|".join(CITY_HINTS) + r")", re.IGNORECASE)
+    street_re = re.compile(
+        r"(вул\.|вулиця|улица|ул\.|просп\.|пр-т|проспект|шосе|ш\.)",
+        re.IGNORECASE
+    )
 
     for line in lines:
-        m = pattern.search(line)
-        if not m:
+        lower = line.lower()
+        has_city = any(city.lower() in lower for city in CITY_HINTS)
+        has_street = bool(street_re.search(line))
+        has_number = bool(re.search(r"\d", line))
+
+        if not (has_city or (has_street and has_number)):
             continue
 
-        addr = line[m.start():].strip()
-        addr = addr.replace("м.", "").replace("р.", "").strip(", ").strip()
+        addr = line.strip()
+
+        # если в строке нет города вообще, добавим ", Київ"
+        if not any(city.lower() in addr.lower() for city in CITY_HINTS):
+            addr = addr + ", Київ"
+
         addresses.append(addr)
 
     # Убираем дубли, сохраняем порядок
@@ -57,22 +75,22 @@ def extract_addresses(text: str):
     return result
 
 
-# === URL BUILDER (кодируем, чтобы НЕ было пробелов) ===
+# === URL BUILDER (кодируем, чтобы не было пробелов) ===
 
 def encode_point(point: str) -> str:
     """
-    Кодируем адрес для URL.
-    Все пробелы и кириллица превращаются в %D0... и %20,
-    чтобы Telegram видел ссылку как одно целое и не рвал её.
+    Кодируем адрес для URL:
+    пробелы и кириллица → %D0..., %20 и т.д.,
+    чтобы Telegram видел ссылку как одно целое.
     """
-    return urllib.parse.quote(point, safe="")  # ничего не оставляем «сырым»
+    return urllib.parse.quote(point, safe="")  # ничего не оставляем сырым
 
 
 def build_maps_url(base: str, waypoints: list[str]) -> str:
     """
     Формат:
-    https://www.google.com/maps/dir/Точка1/Точка2/.../ТочкаN
-    (но все точки уже процодированы encode_point)
+    https://www.google.com/maps/dir/POINT1/POINT2/.../POINTN
+    где POINT* уже закодированы.
     """
     points = [base] + waypoints + [base]
     encoded_points = [encode_point(p) for p in points]
@@ -83,7 +101,7 @@ def build_maps_url(base: str, waypoints: list[str]) -> str:
 # === DISTANCE COUNTING ===
 
 def get_distance_km(base: str, waypoints: list[str]) -> float:
-    """Считаем дистанцию через Google Directions API (НЕ кодированные строки!)."""
+    """Считаем дистанцию через Google Directions API (сырые строки, без encode_point)."""
     if not GOOGLE_API_KEY:
         print("Нет GOOGLE_MAPS_API_KEY!")
         return -1
@@ -131,13 +149,12 @@ def handle_message(message):
     maps_url = build_maps_url(BASE_POINT, addresses)
     distance = get_distance_km(BASE_POINT, addresses)
 
-    reply_lines = ["🚗 Маршрут на день (старт/фініш: м. Харківська):", ""]
+    reply_lines = ["🚗 Маршрут на день (старт/фініш: Харківське шосе 19А, Київ):", ""]
 
     for i, a in enumerate(addresses, start=1):
         reply_lines.append(f"{i}) {a}")
 
     reply_lines.append("")
-    # ТУТ уже закодированная строка без пробелов — Telegram не порвёт ссылку
     reply_lines.append(f"🔗 Маршрут: {maps_url}")
 
     if distance > 0:
@@ -146,7 +163,7 @@ def handle_message(message):
         reply_lines.append("📏 Не вдалося порахувати дистанцію.")
 
     text = "\n".join(reply_lines)
-    bot.reply_to(message, text)  # БЕЗ parse_mode, обычный текст
+    bot.reply_to(message, text)
 
 
 # === FLASK / WEBHOOK ===
