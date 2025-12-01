@@ -1,97 +1,85 @@
 import os
 import re
 import requests
-import urllib.parse
 import telebot
 from flask import Flask, request
 
-# ==== КОНФИГ ====
+# === CONFIG ===
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GOOGLE_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 
-# Старт / финиш маршрута
 BASE_POINT = "Метро Харківська, Київ"
 
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN не задан в переменных окружения")
+    raise RuntimeError("TELEGRAM_BOT_TOKEN не задан!")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 app = Flask(__name__)
 
-# Города / локации, которые чаще всего у тебя встречаются в адресах
 CITY_HINTS = [
     "Київ", "Киев",
     "Ірпінь", "Ирпень",
     "Гостомель", "Буча",
-    "Чабани", "Крюківщина",
-    "Білогородка", "Гнідин",
-    "Крюковщина", "Святопетрівське",
-    "Борщагівка"
+    "Чабани", "Крюківщина", "Крюковщина",
+    "Білогородка", "Гнідин", "Святопетрівське",
+    "Вишневе", "Солом‘янка"
 ]
 
 
+# === ADDRESS EXTRACTION ===
+
 def extract_addresses(text: str):
-    """
-    Из текста вытаскиваем строки, в которых есть название города из CITY_HINTS.
-    Берём адрес от упоминания города до конца строки.
-    Возвращаем список уникальных адресов в порядке появления.
-    """
+    """Извлекаем адреса из сообщения."""
     addresses = []
     lines = [l.strip() for l in text.split("\n") if l.strip()]
 
-    city_pattern = re.compile(r"(" + "|".join(CITY_HINTS) + r")", re.IGNORECASE)
+    pattern = re.compile(r"(" + "|".join(CITY_HINTS) + r")", re.IGNORECASE)
 
     for line in lines:
-        m = city_pattern.search(line)
+        m = pattern.search(line)
         if not m:
             continue
 
         addr = line[m.start():].strip()
-        # Немного подчистить мусор
         addr = addr.replace("м.", "").replace("р.", "").strip(", ").strip()
         addresses.append(addr)
 
-    # Уникализируем, но сохраняем порядок
-    seen = set()
+    # Убираем дубли, сохраняем порядок
     result = []
+    seen = set()
     for a in addresses:
         if a not in seen:
             seen.add(a)
             result.append(a)
+
     return result
 
 
+# === URL BUILDER (НОРМАЛЬНЫЙ, БЕЗ КОДИРОВАНИЯ!) ===
+
 def build_maps_url(base: str, waypoints: list[str]) -> str:
     """
-    Строим ссылку вида:
-    https://www.google.com/maps/dir/?api=1&travelmode=driving&origin=...&destination=...&waypoints=...
-    Адреса передаём как обычный текст, urlencode делает кодирование один раз корректно.
+    Строим URL без ручного кодирования.
+    Адреса передаются живым текстом.
+    Телеграм сам корректно кодирует ссылку при отправке.
     """
-    params = {
-        "api": "1",
-        "travelmode": "driving",
-        "origin": base,
-        "destination": base,
-    }
+    url = "https://www.google.com/maps/dir/?api=1&travelmode=driving"
+    url += f"&origin={base}"
+    url += f"&destination={base}"
 
     if waypoints:
-        # Живой текст адресов, разделённый "|"
-        params["waypoints"] = "|".join(waypoints)
+        url += "&waypoints=" + "|".join(waypoints)
 
-    # safe="|, " — не кодировать разделитель waypoints и запятые
-    query = urllib.parse.urlencode(params, safe="|, ")
+    return url
 
-    return "https://www.google.com/maps/dir/?" + query
 
+# === DISTANCE COUNTING ===
 
 def get_distance_km(base: str, waypoints: list[str]) -> float:
-    """
-    Считаем дистанцию через Google Directions API.
-    Возвращаем километры (одна цифра после запятой) или -1, если не получилось.
-    """
+    """Считаем дистанцию через Google Directions API."""
     if not GOOGLE_API_KEY:
-        print("WARNING: GOOGLE_MAPS_API_KEY не задан")
+        print("Нет GOOGLE_MAPS_API_KEY!")
         return -1
 
     params = {
@@ -104,7 +92,6 @@ def get_distance_km(base: str, waypoints: list[str]) -> float:
     }
 
     if waypoints:
-        # Пусть Google сам оптимизирует порядок точек
         params["waypoints"] = "optimize:true|" + "|".join(waypoints)
 
     resp = requests.get(
@@ -112,62 +99,53 @@ def get_distance_km(base: str, waypoints: list[str]) -> float:
         params=params,
         timeout=10
     )
+
     data = resp.json()
 
     if data.get("status") != "OK":
-        print("Directions API error:", data.get("status"), data.get("error_message"))
+        print("Directions API error:", data)
         return -1
 
-    route = data["routes"][0]
-    legs = route.get("legs", [])
-    meters = sum(leg["distance"]["value"] for leg in legs)
-    km = round(meters / 1000.0, 1)
-    return km
+    meters = sum(leg["distance"]["value"] for leg in data["routes"][0]["legs"])
+    return round(meters / 1000.0, 1)
 
+
+# === BOT HANDLER ===
 
 @bot.message_handler(func=lambda m: True)
-def handle_route_message(message: telebot.types.Message):
-    """
-    Любое текстовое сообщение → пробуем вытащить адреса.
-    Если адреса найдены — отвечаем маршрутом.
-    Если нет — молчим (чтобы бот не мешал в чате).
-    """
+def handle_message(message):
     if not message.text:
         return
 
-    text = message.text
-    addresses = extract_addresses(text)
+    addresses = extract_addresses(message.text)
 
     if not addresses:
-        return
+        return  # Молчим, если нет адресов
 
     maps_url = build_maps_url(BASE_POINT, addresses)
-    distance_km = get_distance_km(BASE_POINT, addresses)
+    distance = get_distance_km(BASE_POINT, addresses)
 
-    lines = ["🚗 Маршрут на день (старт/фініш: м. Харківська):", ""]
-    for i, addr in enumerate(addresses, start=1):
-        lines.append(f"{i}) {addr}")
+    reply = ["🚗 Маршрут на день (старт/фініш: м. Харківська):", ""]
 
-    lines.append("")
-    lines.append(f"🔗 Маршрут: {maps_url}")
+    for i, a in enumerate(addresses, start=1):
+        reply.append(f"{i}) {a}")
 
-    if distance_km > 0:
-        lines.append(f"📏 Дистанція: {distance_km} км")
+    reply.append("")
+    reply.append(f"🔗 Маршрут: {maps_url}")
+
+    if distance > 0:
+        reply.append(f"📏 Дистанція: {distance} км")
     else:
-        lines.append("📏 Не вдалося порахувати дистанцію (немає API ключа або помилка).")
+        reply.append("📏 Не вдалося порахувати дистанцію.")
 
-    bot.reply_to(message, "\n".join(lines))
+    bot.reply_to(message, "\n".join(reply))
 
 
-# ==== FLASK + WEBHOOK ====
-
+# === FLASK / WEBHOOK ===
 
 @app.route("/" + TELEGRAM_TOKEN, methods=["POST"])
-def webhook():
-    """
-    Сюда Telegram шлёт апдейты (webhook).
-    """
-    update_json = request.get_data().decode("utf-8")
+def telegram_webhook():
+    update_json = request.data.decode("utf-8")
     update = telebot.types.Update.de_json(update_json)
     bot.process_new_updates([update])
     return "OK", 200
@@ -175,23 +153,18 @@ def webhook():
 
 @app.route("/", methods=["GET"])
 def index():
-    """
-    Просто проверка, что сервис жив.
-    """
     return "Bot is running", 200
 
 
 if __name__ == "__main__":
-    # Если Render прокинул внешний URL — ставим webhook автоматически
     base_url = os.getenv("RENDER_EXTERNAL_URL")
+
     if base_url:
         webhook_url = f"{base_url.rstrip('/')}/{TELEGRAM_TOKEN}"
         bot.remove_webhook()
         bot.set_webhook(url=webhook_url)
         print("Webhook set to:", webhook_url)
     else:
-        print("WARNING: RENDER_EXTERNAL_URL не задан, webhook нужно выставить вручную")
+        print("WARNING: RENDER_EXTERNAL_URL не задан. Поставь вебхук вручную.")
 
-    port = int(os.environ.get("PORT", 5000))
-    print(f"Bot started on port {port}...")
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
